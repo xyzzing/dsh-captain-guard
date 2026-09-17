@@ -1,0 +1,20 @@
+# Editor / OS
+.DS_Store
+*.swp
+*~
+
+# Backups and dev artifacts
+*.bak
+*.diag*
+*.old
+*.orig
+
+# Node
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+
+# Build (if you add a build step later)
+lib/
+dist/
