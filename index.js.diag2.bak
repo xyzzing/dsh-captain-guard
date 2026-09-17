@@ -1,0 +1,221 @@
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+// ---------------------------------------------------------------------------
+// Defaults
+// ---------------------------------------------------------------------------
+
+const DEFAULT_ALLOWLIST = [
+  'graft_map',
+  'graft_skeleton',
+  'graft_ask',
+  'fs_read_range',
+  'agent_teams_create',
+  'agent_teams_add_member',
+  'agent_teams_status',
+  'agent_teams_task_create',
+  'agent_teams_task_list',
+  'agent_teams_task_get',
+  'agent_teams_task_update',
+  'agent_teams_message',
+];
+
+const STATE_FILE = path.join(os.homedir(), '.dsh', 'captain-guard.state');
+
+// ---------------------------------------------------------------------------
+// Logging — always console.log/error so output lands in the boot log.
+// Cordis's ctx.logger writes to a structured sink we can't grep.
+// ---------------------------------------------------------------------------
+
+function log(msg, data) {
+  try {
+    if (data !== undefined) {
+      console.log(`[captain-guard] ${msg}`, JSON.stringify(data));
+    } else {
+      console.log(`[captain-guard] ${msg}`);
+    }
+  } catch (_) {}
+}
+
+function warn(msg, data) {
+  try {
+    if (data !== undefined) {
+      console.warn(`[captain-guard] ${msg}`, JSON.stringify(data));
+    } else {
+      console.warn(`[captain-guard] ${msg}`);
+    }
+  } catch (_) {}
+}
+
+// ---------------------------------------------------------------------------
+// Cordis plugin object
+// ---------------------------------------------------------------------------
+
+module.exports = {
+  name: 'captain-guard',
+
+  apply(ctx, config) {
+    const cfg = Object.assign(
+      {
+        enabled: true,
+        captainPreset: 'captain',
+        allowlist: DEFAULT_ALLOWLIST,
+      },
+      config || {},
+    );
+
+    function readState() {
+      try {
+        if (fs.existsSync(STATE_FILE)) {
+          const raw = fs.readFileSync(STATE_FILE, 'utf8').trim().toLowerCase();
+          if (['on', 'enabled', 'true', '1', 'yes'].includes(raw)) {
+            return { enabled: true, source: `state-file:${raw}` };
+          }
+          if (['off', 'disabled', 'false', '0', 'no'].includes(raw)) {
+            return { enabled: false, source: `state-file:${raw}` };
+          }
+          warn('state file unrecognized; using config', { content: raw });
+        }
+      } catch (err) {
+        warn('state file read failed; using config', { error: err.message });
+      }
+      return { enabled: cfg.enabled !== false, source: 'config' };
+    }
+
+    function extractToolNames(agent) {
+      try {
+        let tools = [];
+        if (agent && agent.ctx && agent.ctx.tools && typeof agent.ctx.tools.list === 'function') {
+          tools = agent.ctx.tools.list();
+        } else if (agent && agent.tools && typeof agent.tools.list === 'function') {
+          tools = agent.tools.list();
+        } else if (agent && Array.isArray(agent.tools)) {
+          tools = agent.tools;
+        }
+        return tools.map((t) => (typeof t === 'string' ? t : t && t.name)).filter(Boolean);
+      } catch (_) {
+        return [];
+      }
+    }
+
+    function extractPresetName(agent) {
+      try {
+        return (
+          (agent && agent.preset && agent.preset.id) ||
+          (agent && agent.presetName) ||
+          (agent && agent.ctx && agent.ctx.preset && agent.ctx.preset.id) ||
+          (agent && agent.ctx && agent.ctx.presetName) ||
+          null
+        );
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function isCaptain(agent) {
+      const presetName = extractPresetName(agent);
+      if (cfg.captainPreset && presetName && presetName === cfg.captainPreset) {
+        return { matched: true, reason: `preset="${presetName}"` };
+      }
+      const names = extractToolNames(agent);
+      if (names.includes('agent_teams_create')) {
+        return {
+          matched: true,
+          reason: `has agent_teams_create (preset="${presetName || 'unknown'}")`,
+        };
+      }
+      return {
+        matched: false,
+        reason: `preset="${presetName || 'unknown'}", toolCount=${names.length}`,
+      };
+    }
+
+    function applyAllowlist(agent) {
+      try {
+        const toolsCtx =
+          (agent && agent.ctx && agent.ctx.tools) ||
+          (agent && agent.tools) ||
+          null;
+        if (!toolsCtx || typeof toolsCtx.restrict !== 'function') {
+          warn('tools.restrict is not available on this agent scope', {
+            agentId: agent && agent.id,
+          });
+          return false;
+        }
+        const allow =
+          Array.isArray(cfg.allowlist) && cfg.allowlist.length > 0
+            ? cfg.allowlist
+            : DEFAULT_ALLOWLIST;
+        toolsCtx.restrict({ allow });
+        return true;
+      } catch (err) {
+        warn('tools.restrict threw', { error: err.message, stack: err.stack });
+        return false;
+      }
+    }
+
+    // ---------------------------------------------------------------------
+    // Subscribe to agent creation
+    // ---------------------------------------------------------------------
+
+    const hasOn = ctx && typeof ctx.on === 'function';
+    log('subscribing to agent/created', { hasOn });
+
+    if (hasOn) {
+      try {
+        ctx.on('agent/created', (agent) => {
+          try {
+            const state = readState();
+            if (!state.enabled) {
+              log('guard is OFF — skipping', { source: state.source });
+              return;
+            }
+            const detection = isCaptain(agent);
+            if (!detection.matched) {
+              log('agent is not the captain — skipping', {
+                reason: detection.reason,
+                agentId: agent && agent.id,
+              });
+              return;
+            }
+            const applied = applyAllowlist(agent);
+            if (applied) {
+              log('captain allowlist applied', {
+                reason: detection.reason,
+                agentId: agent && agent.id,
+                allowCount: (cfg.allowlist || DEFAULT_ALLOWLIST).length,
+              });
+            }
+          } catch (err) {
+            warn('agent/created handler failed', {
+              error: err.message,
+              stack: err.stack,
+            });
+          }
+        });
+        log('agent/created subscription OK');
+      } catch (err) {
+        warn('failed to subscribe to agent/created', { error: err.message });
+      }
+    } else {
+      warn('ctx.on is not a function — cannot subscribe');
+    }
+
+    // ---------------------------------------------------------------------
+    // Boot line
+    // ---------------------------------------------------------------------
+
+    const initialState = readState();
+    log('captain-guard loaded', {
+      defaultEnabled: cfg.enabled !== false,
+      currentState: initialState.enabled ? 'ON' : 'OFF',
+      stateSource: initialState.source,
+      captainPreset: cfg.captainPreset,
+      allowCount: (cfg.allowlist || DEFAULT_ALLOWLIST).length,
+      stateFile: STATE_FILE,
+    });
+  },
+};

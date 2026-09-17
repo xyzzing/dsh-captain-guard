@@ -1,0 +1,9 @@
+# Bundle patch for the captain-guard plugin: inserts its plugin row into the
+# web profile roster. Applied as a profile bundle layer (the `dsh.bundle.patch`
+# manifest field).
+- insert:
+    - id: captain-guard
+      name: 'dsh-captain-guard'
+      config:
+        enabled: true
+        captainPreset: captain
